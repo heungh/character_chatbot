@@ -1,0 +1,44 @@
+# Git
+.git
+.gitignore
+
+# Images (served via CloudFront CDN)
+image/
+
+# Admin app
+admin_app*.py
+admin_config.json
+
+# Dev/backup files
+*.backup*
+*copy*
+*.log
+__pycache__
+*.pyc
+
+# Build artifacts
+nova_imagebuilder/
+image_builder/
+rumi/
+
+# Deploy scripts
+deploy/
+
+# IDE
+.vscode/
+.idea/
+
+# Docker
+Dockerfile
+.dockerignore
+docker-compose*.yml
+
+# Documentation
+*.md
+
+# Hidden characters (will be managed via DDB in production)
+hidden_characters.json
+
+# Setup scripts (not needed at runtime)
+character_chatbot_setup_memory.py
+character_chatbot_setup_kb.py

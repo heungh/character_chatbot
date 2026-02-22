@@ -1,0 +1,12 @@
+{
+  "cognito_user_pool_id": "<YOUR_COGNITO_USER_POOL_ID>",
+  "cognito_client_id": "<YOUR_COGNITO_CLIENT_ID>",
+  "region": "us-east-1",
+  "dynamodb_tables": {
+    "users": "CharacterChatbot-Users",
+    "conversations": "CharacterChatbot-Conversations",
+    "memories": "CharacterChatbot-Memories"
+  },
+  "image_cdn_url": "<YOUR_IMAGE_CDN_URL>",
+  "image_cdn_distribution_id": "<YOUR_IMAGE_CDN_DISTRIBUTION_ID>"
+}

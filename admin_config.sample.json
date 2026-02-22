@@ -1,0 +1,19 @@
+{
+  "region": "us-east-1",
+  "bucket_name": "<YOUR_S3_BUCKET_NAME>",
+  "knowledge_base_id": "<YOUR_KNOWLEDGE_BASE_ID>",
+  "content_data_source_id": "<YOUR_DATA_SOURCE_ID>",
+  "content_data_prefix": "content-data/",
+  "cognito_user_pool_id": "<YOUR_COGNITO_USER_POOL_ID>",
+  "cognito_client_id": "<YOUR_COGNITO_CLIENT_ID>",
+  "dynamodb_tables": {
+    "metadata": "ContentCatalog-Metadata",
+    "characters": "ContentCatalog-Characters",
+    "relationships": "ContentCatalog-Relationships"
+  },
+  "app_cloudfront_domain": "<YOUR_APP_CLOUDFRONT_DOMAIN>",
+  "app_cloudfront_distribution_id": "<YOUR_APP_CLOUDFRONT_DISTRIBUTION_ID>",
+  "alb_dns": "<YOUR_ALB_DNS>",
+  "ecs_cluster": "character-chatbot-cluster",
+  "ecs_service": "character-chatbot-service"
+}
