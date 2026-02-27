@@ -34,7 +34,7 @@ graph TB
     subgraph AWS_Services["AWS 백엔드 서비스 (us-east-1)"]
         Bedrock["Bedrock Runtime<br/>Claude Sonnet 4.5"]
         KB["Bedrock Knowledge Base<br/>+ OpenSearch Serverless"]
-        DDB["DynamoDB<br/>Users / Conversations / Memories"]
+        DDB["DynamoDB<br/>character_chatbot (Single-Table)"]
         Cognito["Cognito User Pool<br/>인증 / 회원관리"]
     end
 
@@ -288,9 +288,7 @@ aws ecs list-services --cluster <YOUR_ECS_CLUSTER> --query "serviceArns" --outpu
   "region": "us-east-1",
   "bucket_name": "<YOUR_S3_BUCKET>",
   "dynamodb_tables": {
-    "users": "CharacterChatbot-Users",
-    "conversations": "CharacterChatbot-Conversations",
-    "memories": "CharacterChatbot-Memories"
+    "chatbot": "character_chatbot"
   },
   "image_cdn_url": "<YOUR_IMAGE_CDN_URL>",
   "image_cdn_distribution_id": "<YOUR_IMAGE_CDN_DISTRIBUTION_ID>"
@@ -363,9 +361,9 @@ DDB/S3에 저장된 사용자 데이터를 종합하여 Bedrock Claude로 분석
 
 | 테이블/경로 | 수집 항목 |
 |---|---|
-| CharacterChatbot-Users | 프로필 (닉네임, 성별, 생일, 관심사, 취향, 선호 주제) |
-| CharacterChatbot-Conversations | 대화 통계 (캐릭터별 대화 수, 감정 분포, 키워드) |
-| CharacterChatbot-Memories | 장기 기억 (preference, fact, emphasis 카테고리별) |
+| character_chatbot (USER 엔티티) | 프로필 (닉네임, 성별, 생일, 관심사, 취향, 선호 주제) |
+| character_chatbot (CONVERSATION 엔티티) | 대화 통계 (캐릭터별 대화 수, 감정 분포, 키워드) |
+| character_chatbot (MEMORY 엔티티) | 장기 기억 (preference, fact, emphasis 카테고리별) |
 | S3 chat-logs/{user_id}/ | 최근 대화 로그 샘플 |
 | ContentCatalog-Metadata | 콘텐츠 카탈로그 (추천 대상) |
 | ContentCatalog-Characters | 캐릭터 목록 (추천 근거) |
@@ -402,15 +400,30 @@ streamlit run story_app.py --server.port 8505
 
 ## DynamoDB 스키마
 
-### 챗봇 테이블
+### 챗봇 테이블 — Single-Table Design
 
-#### CharacterChatbot-Users
+테이블명: `character_chatbot` (PK/SK + GSI1)
+
+하나의 DynamoDB 테이블에 3가지 엔티티(USER, CONVERSATION, MEMORY)를 저장합니다.
+
+#### 키 설계
+
+| 엔티티 | PK | SK | GSI1_PK | GSI1_SK |
+|--------|----|----|---------|---------|
+| USER | `USER#<user_id>` | `PROFILE` | `USERS` | `<user_id>` |
+| CONVERSATION | `USER#<user_id>` | `CONV#<character>#<session_start>` | `USER#<user_id>` | `CONV#<session_start>` |
+| MEMORY | `USER#<user_id>` | `MEM#<character>#<uuid12>` | `USER#<user_id>` | `MEM#<character>` |
+
+GSI: `GSI1` (GSI1_PK + GSI1_SK, 사용자 목록/시간순 대화/캐릭터별 메모리 조회)
+
+#### USER 엔티티
 
 사용자 프로필 및 온보딩 상태. 챗봇 로그인 시 자동 생성, 대화 중 LLM이 정보를 추출하여 업데이트.
 
-| 키 | 타입 | 설명 |
-|----|------|------|
-| `user_id` (PK) | S | Cognito sub UUID |
+| 속성 | 타입 | 설명 |
+|------|------|------|
+| `entity_type` | S | `"USER"` |
+| `user_id` | S | Cognito sub UUID |
 | `email` | S | 이메일 |
 | `display_name` | S | Cognito 표시명 |
 | `nickname` | S | 대화 중 수집한 닉네임 |
@@ -426,14 +439,15 @@ streamlit run story_app.py --server.port 8505
 | `updated_at` | S | ISO 8601 |
 | `last_login_at` | S | ISO 8601 |
 
-#### CharacterChatbot-Conversations
+#### CONVERSATION 엔티티
 
 대화 세션 요약. 캐릭터 전환 또는 세션 종료 시 LLM이 대화를 분석하여 저장.
 
-| 키 | 타입 | 설명 |
-|----|------|------|
-| `user_id` (PK) | S | 사용자 ID |
-| `conversation_id` (SK) | S | `{캐릭터}#{session_start}` |
+| 속성 | 타입 | 설명 |
+|------|------|------|
+| `entity_type` | S | `"CONVERSATION"` |
+| `user_id` | S | 사용자 ID |
+| `conversation_id` | S | `{캐릭터}#{session_start}` |
 | `character` | S | 대화 캐릭터명 |
 | `session_start` | S | 세션 시작 시각 (ISO 8601) |
 | `session_end` | S | 세션 종료 시각 |
@@ -445,16 +459,15 @@ streamlit run story_app.py --server.port 8505
 | `new_user_info` | M | 대화에서 새로 발견된 사용자 정보 |
 | `s3_log_path` | S | 원본 대화 로그 S3 경로 |
 
-GSI: `CharacterTimeIndex` (user_id + session_start, 시간순 조회)
-
-#### CharacterChatbot-Memories
+#### MEMORY 엔티티
 
 LLM이 대화에서 추출한 장기 기억. 다음 대화 시 컨텍스트로 주입하여 개인화된 대화 제공.
 
-| 키 | 타입 | 설명 |
-|----|------|------|
-| `user_id` (PK) | S | 사용자 ID |
-| `memory_id` (SK) | S | `{character}#{uuid12}` |
+| 속성 | 타입 | 설명 |
+|------|------|------|
+| `entity_type` | S | `"MEMORY"` |
+| `user_id` | S | 사용자 ID |
+| `memory_id` | S | `{character}#{uuid12}` |
 | `character` | S | "global" (전체 공유) 또는 특정 캐릭터명 |
 | `category` | S | fact / preference / emphasis / relationship / event |
 | `content` | S | 기억 내용 (한 문장) |
@@ -465,7 +478,16 @@ LLM이 대화에서 추출한 장기 기억. 다음 대화 시 컨텍스트로 �
 | `created_at` | S | ISO 8601 |
 | `last_referenced` | S | 마지막 참조 시각 |
 
-GSI: `CharacterMemoryIndex` (user_id + character, 캐릭터별 메모리 조회)
+#### 접근 패턴
+
+| 패턴 | 방법 |
+|------|------|
+| 사용자 프로필 조회 | GetItem: `PK=USER#<user_id>, SK=PROFILE` |
+| 전체 사용자 목록 | GSI1 Query: `GSI1_PK=USERS` |
+| 사용자별 대화 목록 | Query: `PK=USER#<user_id>, SK begins_with CONV#` |
+| 최근 대화 (시간순) | GSI1 Query: `GSI1_PK=USER#<user_id>, GSI1_SK begins_with CONV#`, ScanIndexForward=False |
+| 캐릭터별 메모리 조회 | GSI1 Query: `GSI1_PK=USER#<user_id>, GSI1_SK=MEM#<character>` |
+| 사용자별 전체 메모리 | Query: `PK=USER#<user_id>, SK begins_with MEM#` |
 
 ---
 

@@ -26,7 +26,7 @@ def _load_configs():
                 cfg = json.load(f)
                 if not tables and "dynamodb_tables" in cfg:
                     t = cfg["dynamodb_tables"]
-                    if "users" in t:
+                    if "chatbot" in t:
                         tables = t
                 if not bucket:
                     bucket = cfg.get("bucket_name", "")
@@ -36,10 +36,8 @@ def _load_configs():
 
 _tables, _bucket = _load_configs()
 
-# DynamoDB 테이블명 (chatbot 측과 동일)
-TABLE_USERS = _tables.get("users", "CharacterChatbot-Users")
-TABLE_CONVERSATIONS = _tables.get("conversations", "CharacterChatbot-Conversations")
-TABLE_MEMORIES = _tables.get("memories", "CharacterChatbot-Memories")
+# DynamoDB 단일 테이블 (chatbot 측과 동일)
+TABLE_CHATBOT = _tables.get("chatbot", "character_chatbot")
 
 BUCKET_NAME = os.environ.get("S3_BUCKET_NAME", _bucket)
 
@@ -114,20 +112,27 @@ class CustomerAnalyticsManager:
         self.s3 = boto3.client("s3", region_name=region)
         self.bedrock = boto3.client("bedrock-runtime", region_name=region)
 
-        self.table_users = self.ddb.Table(TABLE_USERS)
-        self.table_conversations = self.ddb.Table(TABLE_CONVERSATIONS)
-        self.table_memories = self.ddb.Table(TABLE_MEMORIES)
+        self.table = self.ddb.Table(TABLE_CHATBOT)
 
     # ─── 사용자 목록 ─────────────────────────────────────────────
 
     def list_users(self) -> List[Dict[str, Any]]:
-        """Users 테이블 scan → 전체 사용자 목록"""
+        """GSI1 query(GSI1_PK=USERS) → 전체 사용자 목록"""
         try:
-            resp = self.table_users.scan()
+            resp = self.table.query(
+                IndexName="GSI1",
+                KeyConditionExpression="GSI1_PK = :pk",
+                ExpressionAttributeValues={":pk": "USERS"},
+            )
             items = resp.get("Items", [])
             # 페이지네이션 처리
             while "LastEvaluatedKey" in resp:
-                resp = self.table_users.scan(ExclusiveStartKey=resp["LastEvaluatedKey"])
+                resp = self.table.query(
+                    IndexName="GSI1",
+                    KeyConditionExpression="GSI1_PK = :pk",
+                    ExpressionAttributeValues={":pk": "USERS"},
+                    ExclusiveStartKey=resp["LastEvaluatedKey"],
+                )
                 items.extend(resp.get("Items", []))
             return [self._convert_decimals(i) for i in items]
         except Exception as e:
@@ -139,21 +144,22 @@ class CustomerAnalyticsManager:
     def get_user_full_data(self, user_id: str) -> Dict[str, Any]:
         """프로필 + 대화이력 + 메모리 + 최근 S3 로그 종합"""
         data = {"user_id": user_id}
+        pk = f"USER#{user_id}"
 
         # 1) 프로필
         try:
-            resp = self.table_users.get_item(Key={"user_id": user_id})
+            resp = self.table.get_item(Key={"PK": pk, "SK": "PROFILE"})
             if "Item" in resp:
                 data["profile"] = self._convert_decimals(resp["Item"])
         except Exception as e:
             logger.error("프로필 조회 오류: %s", e)
             data["profile"] = {}
 
-        # 2) 대화이력
+        # 2) 대화이력 (main table query, SK begins_with CONV#)
         try:
-            resp = self.table_conversations.query(
-                KeyConditionExpression="user_id = :uid",
-                ExpressionAttributeValues={":uid": user_id},
+            resp = self.table.query(
+                KeyConditionExpression="PK = :pk AND begins_with(SK, :prefix)",
+                ExpressionAttributeValues={":pk": pk, ":prefix": "CONV#"},
                 ScanIndexForward=False,
             )
             convs = [self._convert_decimals(i) for i in resp.get("Items", [])]
@@ -178,11 +184,11 @@ class CustomerAnalyticsManager:
             data["conversations"] = []
             data["conversation_count"] = 0
 
-        # 3) 메모리
+        # 3) 메모리 (main table query, SK begins_with MEM#)
         try:
-            resp = self.table_memories.query(
-                KeyConditionExpression="user_id = :uid",
-                ExpressionAttributeValues={":uid": user_id},
+            resp = self.table.query(
+                KeyConditionExpression="PK = :pk AND begins_with(SK, :prefix)",
+                ExpressionAttributeValues={":pk": pk, ":prefix": "MEM#"},
             )
             memories = [self._convert_decimals(i) for i in resp.get("Items", [])]
             data["memories"] = memories

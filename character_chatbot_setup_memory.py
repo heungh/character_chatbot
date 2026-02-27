@@ -15,56 +15,24 @@ REGION = "us-east-1"
 
 TABLES = [
     {
-        "TableName": "CharacterChatbot-Users",
+        "TableName": "character_chatbot",
         "KeySchema": [
-            {"AttributeName": "user_id", "KeyType": "HASH"},
+            {"AttributeName": "PK", "KeyType": "HASH"},
+            {"AttributeName": "SK", "KeyType": "RANGE"},
         ],
         "AttributeDefinitions": [
-            {"AttributeName": "user_id", "AttributeType": "S"},
-        ],
-        "BillingMode": "PAY_PER_REQUEST",
-    },
-    {
-        "TableName": "CharacterChatbot-Conversations",
-        "KeySchema": [
-            {"AttributeName": "user_id", "KeyType": "HASH"},
-            {"AttributeName": "conversation_id", "KeyType": "RANGE"},
-        ],
-        "AttributeDefinitions": [
-            {"AttributeName": "user_id", "AttributeType": "S"},
-            {"AttributeName": "conversation_id", "AttributeType": "S"},
-            {"AttributeName": "session_start", "AttributeType": "S"},
+            {"AttributeName": "PK", "AttributeType": "S"},
+            {"AttributeName": "SK", "AttributeType": "S"},
+            {"AttributeName": "GSI1_PK", "AttributeType": "S"},
+            {"AttributeName": "GSI1_SK", "AttributeType": "S"},
         ],
         "BillingMode": "PAY_PER_REQUEST",
         "GlobalSecondaryIndexes": [
             {
-                "IndexName": "CharacterTimeIndex",
+                "IndexName": "GSI1",
                 "KeySchema": [
-                    {"AttributeName": "user_id", "KeyType": "HASH"},
-                    {"AttributeName": "session_start", "KeyType": "RANGE"},
-                ],
-                "Projection": {"ProjectionType": "ALL"},
-            }
-        ],
-    },
-    {
-        "TableName": "CharacterChatbot-Memories",
-        "KeySchema": [
-            {"AttributeName": "user_id", "KeyType": "HASH"},
-            {"AttributeName": "memory_id", "KeyType": "RANGE"},
-        ],
-        "AttributeDefinitions": [
-            {"AttributeName": "user_id", "AttributeType": "S"},
-            {"AttributeName": "memory_id", "AttributeType": "S"},
-            {"AttributeName": "character", "AttributeType": "S"},
-        ],
-        "BillingMode": "PAY_PER_REQUEST",
-        "GlobalSecondaryIndexes": [
-            {
-                "IndexName": "CharacterMemoryIndex",
-                "KeySchema": [
-                    {"AttributeName": "user_id", "KeyType": "HASH"},
-                    {"AttributeName": "character", "KeyType": "RANGE"},
+                    {"AttributeName": "GSI1_PK", "KeyType": "HASH"},
+                    {"AttributeName": "GSI1_SK", "KeyType": "RANGE"},
                 ],
                 "Projection": {"ProjectionType": "ALL"},
             }
@@ -193,9 +161,7 @@ def print_config(pool_id, client_id):
         "cognito_client_id": client_id,
         "region": REGION,
         "dynamodb_tables": {
-            "users": "CharacterChatbot-Users",
-            "conversations": "CharacterChatbot-Conversations",
-            "memories": "CharacterChatbot-Memories",
+            "chatbot": "character_chatbot",
         },
     }
     print("\n" + "=" * 60)

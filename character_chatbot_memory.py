@@ -35,11 +35,8 @@ if not BUCKET_NAME:
     except (FileNotFoundError, json.JSONDecodeError):
         pass
 
-# DynamoDB 테이블명
-_ddb_tables = _chatbot_cfg.get("dynamodb_tables", {})
-TABLE_USERS = _ddb_tables.get("users", "CharacterChatbot-Users")
-TABLE_CONVERSATIONS = _ddb_tables.get("conversations", "CharacterChatbot-Conversations")
-TABLE_MEMORIES = _ddb_tables.get("memories", "CharacterChatbot-Memories")
+# DynamoDB 단일 테이블
+TABLE_CHATBOT = _chatbot_cfg.get("dynamodb_tables", {}).get("chatbot", "character_chatbot")
 
 # 온보딩 단계 정의
 ONBOARDING_STEPS = {
@@ -154,21 +151,20 @@ class ChatbotMemoryManager:
         self.s3 = boto3.client("s3", region_name=region)
         self.bedrock = boto3.client("bedrock-runtime", region_name=region)
 
-        self.table_users = self.ddb.Table(TABLE_USERS)
-        self.table_conversations = self.ddb.Table(TABLE_CONVERSATIONS)
-        self.table_memories = self.ddb.Table(TABLE_MEMORIES)
+        self.table = self.ddb.Table(TABLE_CHATBOT)
 
     # ─── 사용자 프로필 ──────────────────────────────────────────────
 
     def get_or_create_user(self, user_id: str, email: str, display_name: str) -> Dict[str, Any]:
         """로그인 시 사용자 프로필 조회/생성"""
         now = datetime.now(timezone.utc).isoformat()
+        pk = f"USER#{user_id}"
 
-        resp = self.table_users.get_item(Key={"user_id": user_id})
+        resp = self.table.get_item(Key={"PK": pk, "SK": "PROFILE"})
         if "Item" in resp:
             # 기존 사용자 - last_login 업데이트
-            self.table_users.update_item(
-                Key={"user_id": user_id},
+            self.table.update_item(
+                Key={"PK": pk, "SK": "PROFILE"},
                 UpdateExpression="SET last_login_at = :now, total_sessions = if_not_exists(total_sessions, :zero) + :one",
                 ExpressionAttributeValues={":now": now, ":zero": 0, ":one": 1},
             )
@@ -179,6 +175,11 @@ class ChatbotMemoryManager:
 
         # 새 사용자 생성
         user = {
+            "PK": pk,
+            "SK": "PROFILE",
+            "GSI1_PK": "USERS",
+            "GSI1_SK": user_id,
+            "entity_type": "USER",
             "user_id": user_id,
             "email": email,
             "display_name": display_name,
@@ -194,12 +195,12 @@ class ChatbotMemoryManager:
             "last_login_at": now,
             "total_sessions": 1,
         }
-        self.table_users.put_item(Item=user)
+        self.table.put_item(Item=user)
         return user
 
     def get_user_profile(self, user_id: str) -> Optional[Dict[str, Any]]:
         """사용자 프로필 조회"""
-        resp = self.table_users.get_item(Key={"user_id": user_id})
+        resp = self.table.get_item(Key={"PK": f"USER#{user_id}", "SK": "PROFILE"})
         if "Item" in resp:
             return self._convert_decimals(resp["Item"])
         return None
@@ -222,8 +223,8 @@ class ChatbotMemoryManager:
             attr_names[placeholder] = key
             attr_values[val_placeholder] = value
 
-        self.table_users.update_item(
-            Key={"user_id": user_id},
+        self.table.update_item(
+            Key={"PK": f"USER#{user_id}", "SK": "PROFILE"},
             UpdateExpression="SET " + ", ".join(expr_parts),
             ExpressionAttributeNames=attr_names,
             ExpressionAttributeValues=attr_values,
@@ -274,8 +275,14 @@ class ChatbotMemoryManager:
         except Exception as e:
             logger.error("S3 로그 저장 오류: %s", e)
 
-        # 3) DDB Conversations 테이블 저장
+        # 3) DDB 대화 저장 (단일 테이블)
+        pk = f"USER#{user_id}"
         conv_item = {
+            "PK": pk,
+            "SK": f"CONV#{conversation_id}",
+            "GSI1_PK": pk,
+            "GSI1_SK": f"CONV#{session_start}",
+            "entity_type": "CONVERSATION",
             "user_id": user_id,
             "conversation_id": conversation_id,
             "character": character,
@@ -290,15 +297,20 @@ class ChatbotMemoryManager:
             "new_user_info": extraction.get("new_user_info", {}),
         }
         try:
-            self.table_conversations.put_item(Item=self._sanitize_for_ddb(conv_item))
+            self.table.put_item(Item=self._sanitize_for_ddb(conv_item))
         except Exception as e:
             logger.error("DDB 대화 저장 오류: %s", e)
 
-        # 4) DDB Memories 테이블에 추출 메모리 저장
+        # 4) DDB 메모리 저장 (단일 테이블)
         for mem in extraction.get("memories", []):
             memory_char = mem.get("character", "global")
             memory_id = f"{memory_char}#{uuid.uuid4().hex[:12]}"
             mem_item = {
+                "PK": pk,
+                "SK": f"MEM#{memory_id}",
+                "GSI1_PK": pk,
+                "GSI1_SK": f"MEM#{memory_char}",
+                "entity_type": "MEMORY",
                 "user_id": user_id,
                 "memory_id": memory_id,
                 "character": memory_char,
@@ -312,7 +324,7 @@ class ChatbotMemoryManager:
                 "active": True,
             }
             try:
-                self.table_memories.put_item(Item=self._sanitize_for_ddb(mem_item))
+                self.table.put_item(Item=self._sanitize_for_ddb(mem_item))
             except Exception as e:
                 logger.error("DDB 메모리 저장 오류: %s", e)
 
@@ -484,30 +496,29 @@ class ChatbotMemoryManager:
         self, user_id: str, character: str, limit: int = 15
     ) -> List[Dict]:
         """캐릭터별 + 글로벌 메모리 조회 (중요도순)"""
+        pk = f"USER#{user_id}"
         try:
-            # GSI로 글로벌 메모리 조회
-            global_resp = self.table_memories.query(
-                IndexName="CharacterMemoryIndex",
-                KeyConditionExpression="user_id = :uid AND #char = :char",
+            # GSI1로 글로벌 메모리 조회
+            global_resp = self.table.query(
+                IndexName="GSI1",
+                KeyConditionExpression="GSI1_PK = :pk AND GSI1_SK = :sk",
                 FilterExpression="active = :active",
-                ExpressionAttributeNames={"#char": "character"},
                 ExpressionAttributeValues={
-                    ":uid": user_id,
-                    ":char": "global",
+                    ":pk": pk,
+                    ":sk": "MEM#global",
                     ":active": True,
                 },
             )
             global_mems = global_resp.get("Items", [])
 
-            # 캐릭터 전용 메모리 조회
-            char_resp = self.table_memories.query(
-                IndexName="CharacterMemoryIndex",
-                KeyConditionExpression="user_id = :uid AND #char = :char",
+            # GSI1로 캐릭터 전용 메모리 조회
+            char_resp = self.table.query(
+                IndexName="GSI1",
+                KeyConditionExpression="GSI1_PK = :pk AND GSI1_SK = :sk",
                 FilterExpression="active = :active",
-                ExpressionAttributeNames={"#char": "character"},
                 ExpressionAttributeValues={
-                    ":uid": user_id,
-                    ":char": character,
+                    ":pk": pk,
+                    ":sk": f"MEM#{character}",
                     ":active": True,
                 },
             )
@@ -520,8 +531,8 @@ class ChatbotMemoryManager:
             # reference_count 증가 (상위 항목만)
             for m in all_mems[:limit]:
                 try:
-                    self.table_memories.update_item(
-                        Key={"user_id": user_id, "memory_id": m["memory_id"]},
+                    self.table.update_item(
+                        Key={"PK": pk, "SK": f"MEM#{m['memory_id']}"},
                         UpdateExpression="SET reference_count = if_not_exists(reference_count, :zero) + :one, last_referenced = :now",
                         ExpressionAttributeValues={
                             ":zero": 0,
@@ -542,13 +553,14 @@ class ChatbotMemoryManager:
     ) -> List[Dict]:
         """최근 대화 요약 조회 (시간역순)"""
         try:
-            resp = self.table_conversations.query(
-                IndexName="CharacterTimeIndex",
-                KeyConditionExpression="user_id = :uid",
+            resp = self.table.query(
+                IndexName="GSI1",
+                KeyConditionExpression="GSI1_PK = :pk AND begins_with(GSI1_SK, :prefix)",
                 FilterExpression="#char = :char",
                 ExpressionAttributeNames={"#char": "character"},
                 ExpressionAttributeValues={
-                    ":uid": user_id,
+                    ":pk": f"USER#{user_id}",
+                    ":prefix": "CONV#",
                     ":char": character,
                 },
                 ScanIndexForward=False,

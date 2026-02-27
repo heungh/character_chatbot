@@ -176,7 +176,10 @@ def create_iam_roles(account_id: str, bucket_name: str = ""):
                         "Effect": "Allow",
                         "Action": ["dynamodb:GetItem", "dynamodb:PutItem", "dynamodb:UpdateItem",
                                    "dynamodb:DeleteItem", "dynamodb:Query", "dynamodb:Scan"],
-                        "Resource": f"arn:aws:dynamodb:{REGION}:{account_id}:table/CharacterChatbot-*",
+                        "Resource": [
+                            f"arn:aws:dynamodb:{REGION}:{account_id}:table/character_chatbot",
+                            f"arn:aws:dynamodb:{REGION}:{account_id}:table/character_chatbot/index/*",
+                        ],
                     },
                     {
                         "Effect": "Allow",
