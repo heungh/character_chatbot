@@ -7,9 +7,7 @@
   "cognito_user_pool_id": "<YOUR_COGNITO_USER_POOL_ID>",
   "cognito_client_id": "<YOUR_COGNITO_CLIENT_ID>",
   "dynamodb_tables": {
-    "metadata": "ContentCatalog-Metadata",
-    "characters": "ContentCatalog-Characters",
-    "relationships": "ContentCatalog-Relationships"
+    "chatbot": "character_chatbot"
   },
   "app_cloudfront_domain": "<YOUR_APP_CLOUDFRONT_DOMAIN>",
   "app_cloudfront_distribution_id": "<YOUR_APP_CLOUDFRONT_DISTRIBUTION_ID>",

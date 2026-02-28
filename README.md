@@ -109,7 +109,8 @@ graph TB
 │   ├── upload_images.py           # 로컬 이미지 → S3 업로드
 │   ├── setup_image_cdn.py         # 이미지 CloudFront + OAC 생성
 │   ├── setup_infra.py             # ECS + ALB + 앱 CloudFront 생성
-│   └── deploy.sh                  # Docker 빌드 → ECR 푸시 → ECS 배포
+│   ├── deploy.sh                  # Docker 빌드 → ECR 푸시 → ECS 배포 (로컬 Docker)
+│   └── deploy_ec2.sh              # EC2 빌드 호스트 → ECR 푸시 → ECS 배포
 │
 ├── admin_app.py                   # 관리자 앱 메인 (Cognito 인증 + 메뉴 라우팅)
 ├── admin_app_data.py              # 관리자 데이터 레이어 (DDB/S3 CRUD + KB 동기화)
@@ -177,30 +178,56 @@ python deploy/setup_image_cdn.py
 
 ```bash
 # ECS 클러스터 + ALB + 앱 CloudFront 생성 (최초 1회)
+# CF_ALB_SECRET 환경변수 설정 시 ALB에 403 default + 헤더 검증 자동 적용
+export CF_ALB_SECRET="your-secret-value"
 python deploy/setup_infra.py
 
-# Docker 빌드 → ECR 푸시 → ECS 서비스 업데이트
-# (Docker Desktop 문제 시 EC2에서 실행 — 아래 참고)
+# 방법 A: 로컬 Docker 빌드 (Docker Desktop 사용 가능 시)
 bash deploy/deploy.sh
+
+# 방법 B: EC2 빌드 호스트 사용 (Docker Desktop 사용 불가 시, 권장)
+bash deploy/deploy_ec2.sh
 ```
 
-### EC2에서 Docker 빌드 (Docker Desktop 사용 불가 시)
+### EC2에서 Docker 빌드 (deploy_ec2.sh)
 
+Docker Desktop이 Mac에서 작동하지 않는 경우 EC2 인스턴스를 빌드 호스트로 사용합니다.
+
+#### 사전 준비 (최초 1회)
 ```bash
-# EC2 인스턴스에 SSH 접속
+# EC2 인스턴스에 Docker 설치
 ssh -i <key>.pem ec2-user@<ip>
+sudo yum install -y docker && sudo systemctl start docker && sudo systemctl enable docker
+```
 
-# Docker 설치
-sudo yum install -y docker && sudo systemctl start docker
+#### 자동 배포 스크립트 사용
+```bash
+# 환경변수 설정
+export EC2_KEY=~/<your-key>.pem
+export EC2_HOST=<ec2-ip>
 
-# 소스 파일 SCP 전송 (로컬에서)
+# 실행: SCP 전송 → Docker 빌드 → ECR 푸시 → ECS 배포 → 안정화 대기
+bash deploy/deploy_ec2.sh
+```
+
+`deploy_ec2.sh`가 자동으로 수행하는 작업:
+1. SSH 연결 테스트 (SG 미허용 시 가이드 출력)
+2. Dockerfile + 소스 파일 SCP 전송
+3. EC2에서 Docker 빌드 + ECR 푸시
+4. ECS 서비스 force-new-deployment
+5. 배포 안정화 대기 (최대 5분)
+
+#### 수동 배포 (참고)
+```bash
+# 1. 소스 파일 SCP 전송
 scp -i <key>.pem \
   Dockerfile .dockerignore requirements.txt chatbot_config.json \
   character_chatbot.py character_chatbot_auth.py \
   character_chatbot_memory.py character_chatbot_scraper.py \
   ec2-user@<ip>:~/chatbot-build/
 
-# EC2에서 빌드 + 푸시
+# 2. EC2에서 빌드 + 푸시
+ssh -i <key>.pem ec2-user@<ip>
 cd ~/chatbot-build
 sudo docker build -t <YOUR_ECR_REPO>:latest .
 aws ecr get-login-password --region us-east-1 | \
@@ -208,7 +235,7 @@ aws ecr get-login-password --region us-east-1 | \
 sudo docker tag <YOUR_ECR_REPO>:latest <account>.dkr.ecr.us-east-1.amazonaws.com/<YOUR_ECR_REPO>:latest
 sudo docker push <account>.dkr.ecr.us-east-1.amazonaws.com/<YOUR_ECR_REPO>:latest
 
-# ECS 서비스 업데이트 (로컬 또는 EC2에서)
+# 3. ECS 서비스 업데이트
 aws ecs update-service --cluster <YOUR_ECS_CLUSTER> \
   --service <YOUR_ECS_SERVICE> --force-new-deployment --region us-east-1
 ```
@@ -307,9 +334,7 @@ aws ecs list-services --cluster <YOUR_ECS_CLUSTER> --query "serviceArns" --outpu
   "cognito_user_pool_id": "<YOUR_COGNITO_USER_POOL_ID>",
   "cognito_client_id": "<YOUR_COGNITO_CLIENT_ID>",
   "dynamodb_tables": {
-    "metadata": "ContentCatalog-Metadata",
-    "characters": "ContentCatalog-Characters",
-    "relationships": "ContentCatalog-Relationships"
+    "chatbot": "character_chatbot"
   },
   "app_cloudfront_domain": "<YOUR_APP_CLOUDFRONT_DOMAIN>",
   "app_cloudfront_distribution_id": "<YOUR_APP_CLOUDFRONT_DISTRIBUTION_ID>",
@@ -347,7 +372,7 @@ streamlit run admin_app.py --server.port 8503
 
 | 메뉴 | 기능 |
 |------|------|
-| 콘텐츠 관리 | 콘텐츠 메타데이터 CRUD (ContentCatalog-Metadata) |
+| 콘텐츠 관리 | 콘텐츠 메타데이터 CRUD (character_chatbot CONTENT 엔티티) |
 | 캐릭터 관리 | 캐릭터 프로필 CRUD + S3 디폴트 이미지 미리보기 |
 | 데이터 수집 | NamuWiki/Wikipedia 스크래핑 → AI 정제 파이프라인 |
 | KB 동기화 | DDB → S3 자연어 프로필 → Bedrock KB 인제스천 |
@@ -365,8 +390,8 @@ DDB/S3에 저장된 사용자 데이터를 종합하여 Bedrock Claude로 분석
 | character_chatbot (CONVERSATION 엔티티) | 대화 통계 (캐릭터별 대화 수, 감정 분포, 키워드) |
 | character_chatbot (MEMORY 엔티티) | 장기 기억 (preference, fact, emphasis 카테고리별) |
 | S3 chat-logs/{user_id}/ | 최근 대화 로그 샘플 |
-| ContentCatalog-Metadata | 콘텐츠 카탈로그 (추천 대상) |
-| ContentCatalog-Characters | 캐릭터 목록 (추천 근거) |
+| character_chatbot (CONTENT 엔티티) | 콘텐츠 카탈로그 (추천 대상) |
+| character_chatbot (CHARACTER 엔티티) | 캐릭터 목록 (추천 근거) |
 
 **분석 탭:**
 - **고객 취향 분석** — 종합 프로필, 캐릭터 선호도, 관심 주제, 감정 패턴, 참여도, 성격 추정
@@ -400,11 +425,9 @@ streamlit run story_app.py --server.port 8505
 
 ## DynamoDB 스키마
 
-### 챗봇 테이블 — Single-Table Design
+### `character_chatbot` — Single-Table Design
 
-테이블명: `character_chatbot` (PK/SK + GSI1)
-
-하나의 DynamoDB 테이블에 3가지 엔티티(USER, CONVERSATION, MEMORY)를 저장합니다.
+하나의 DynamoDB 테이블에 6가지 엔티티(USER, CONVERSATION, MEMORY, CONTENT, CHARACTER, RELATIONSHIP)를 저장합니다.
 
 #### 키 설계
 
@@ -413,8 +436,11 @@ streamlit run story_app.py --server.port 8505
 | USER | `USER#<user_id>` | `PROFILE` | `USERS` | `<user_id>` |
 | CONVERSATION | `USER#<user_id>` | `CONV#<character>#<session_start>` | `USER#<user_id>` | `CONV#<session_start>` |
 | MEMORY | `USER#<user_id>` | `MEM#<character>#<uuid12>` | `USER#<user_id>` | `MEM#<character>` |
+| CONTENT | `CONTENT#<content_id>` | `METADATA` | `CONTENTS` | `<content_id>` |
+| CHARACTER | `CONTENT#<content_id>` | `CHAR#<character_id>` | `CONTENT#<content_id>` | `ROLE#<role_type>#<character_id>` |
+| RELATIONSHIP | `CONTENT#<content_id>` | `REL#<relationship_id>` | `CONTENT#<content_id>` | `REL#<relationship_id>` |
 
-GSI: `GSI1` (GSI1_PK + GSI1_SK, 사용자 목록/시간순 대화/캐릭터별 메모리 조회)
+GSI: `GSI1` (GSI1_PK + GSI1_SK, 사용자 목록/시간순 대화/캐릭터별 메모리/콘텐츠 목록/역할별 캐릭터 조회)
 
 #### USER 엔티티
 
@@ -488,18 +514,23 @@ LLM이 대화에서 추출한 장기 기억. 다음 대화 시 컨텍스트로 �
 | 최근 대화 (시간순) | GSI1 Query: `GSI1_PK=USER#<user_id>, GSI1_SK begins_with CONV#`, ScanIndexForward=False |
 | 캐릭터별 메모리 조회 | GSI1 Query: `GSI1_PK=USER#<user_id>, GSI1_SK=MEM#<character>` |
 | 사용자별 전체 메모리 | Query: `PK=USER#<user_id>, SK begins_with MEM#` |
+| 전체 콘텐츠 목록 | GSI1 Query: `GSI1_PK=CONTENTS` |
+| 콘텐츠 메타데이터 조회 | GetItem: `PK=CONTENT#<content_id>, SK=METADATA` |
+| 콘텐츠별 캐릭터 목록 | Query: `PK=CONTENT#<content_id>, SK begins_with CHAR#` |
+| 역할별 캐릭터 조회 | GSI1 Query: `GSI1_PK=CONTENT#<content_id>, GSI1_SK begins_with ROLE#<role_type>#` |
+| 콘텐츠별 관계 목록 | Query: `PK=CONTENT#<content_id>, SK begins_with REL#` |
+| 콘텐츠 일괄 삭제 | Query: `PK=CONTENT#<content_id>` → batch delete |
 
 ---
 
-### 콘텐츠 카탈로그 테이블
-
-#### ContentCatalog-Metadata
+#### CONTENT 엔티티
 
 콘텐츠(작품) 메타데이터. 관리자 앱에서 CRUD.
 
-| 키 | 타입 | 설명 |
-|----|------|------|
-| `content_id` (PK) | S | 콘텐츠 slug |
+| 속성 | 타입 | 설명 |
+|------|------|------|
+| `entity_type` | S | `"CONTENT"` |
+| `content_id` | S | 콘텐츠 slug |
 | `title` | S | 한글 제목 |
 | `title_en` | S | 영문 제목 |
 | `genre` | L\<S\> | 장르 |
@@ -516,14 +547,15 @@ LLM이 대화에서 추출한 장기 기억. 다음 대화 시 컨텍스트로 �
 | `reception` | M | 평점/수상 (rt_score, imdb_score, awards 등) |
 | `character_count` | N | 등록 캐릭터 수 |
 
-#### ContentCatalog-Characters
+#### CHARACTER 엔티티
 
 캐릭터 프로필. 콘텐츠별 캐릭터 관리.
 
-| 키 | 타입 | 설명 |
-|----|------|------|
-| `content_id` (PK) | S | 콘텐츠 ID |
-| `character_id` (SK) | S | 캐릭터 slug (예: "rumi") |
+| 속성 | 타입 | 설명 |
+|------|------|------|
+| `entity_type` | S | `"CHARACTER"` |
+| `content_id` | S | 콘텐츠 ID |
+| `character_id` | S | 캐릭터 slug |
 | `name` / `name_en` | S | 한글명 / 영문명 |
 | `group` | S | 소속 그룹 |
 | `role_type` | S | protagonist / antagonist / supporting / mentor |
@@ -542,16 +574,15 @@ LLM이 대화에서 추출한 장기 기억. 다음 대화 시 컨텍스트로 �
 | `color_theme` | S | 색상 테마 (hex) |
 | `is_playable` | BOOL | 챗봇 대화 가능 여부 |
 
-GSI: `RoleTypeIndex` (content_id + role_type)
-
-#### ContentCatalog-Relationships
+#### RELATIONSHIP 엔티티
 
 캐릭터 간 관계. 양방향/단방향 관계 표현.
 
-| 키 | 타입 | 설명 |
-|----|------|------|
-| `content_id` (PK) | S | 콘텐츠 ID |
-| `relationship_id` (SK) | S | `{source}#{target}#{type}` |
+| 속성 | 타입 | 설명 |
+|------|------|------|
+| `entity_type` | S | `"RELATIONSHIP"` |
+| `content_id` | S | 콘텐츠 ID |
+| `relationship_id` | S | `{source}#{target}#{type}` |
 | `source_character` | S | 관계 출발 캐릭터 |
 | `target_character` | S | 관계 도착 캐릭터 |
 | `relationship_type` | S | 관계 유형 (팀원, 적, 멘토 등) |

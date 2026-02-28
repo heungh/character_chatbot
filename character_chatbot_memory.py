@@ -451,7 +451,7 @@ class ChatbotMemoryManager:
                 if isinstance(kpop, dict):
                     for k, v in kpop.items():
                         if v:
-                            profile_lines.append(f"케이팝 {k}: {v if isinstance(v, str) else ', '.join(v)}")
+                            profile_lines.append(f"케이팝 {k}: {v if isinstance(v, str) else ', '.join(v) if isinstance(v, list) else str(v)}")
             if profile.get("preferred_topics"):
                 profile_lines.append(f"선호 주제: {', '.join(profile['preferred_topics'])}")
 

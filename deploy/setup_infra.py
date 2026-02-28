@@ -227,16 +227,11 @@ def create_alb(subnet_ids: list, alb_sg_id: str, vpc_id: str):
                     tg_arn = tg["TargetGroupArn"]
                     break
 
-            # 리스너 존재 확인 — 없으면 생성
+            # 리스너 존재 확인 — 없으면 보안 리스너 생성 (403 default + CF header rule)
             listeners = elbv2.describe_listeners(LoadBalancerArn=alb_arn)["Listeners"]
             if not listeners and tg_arn:
-                elbv2.create_listener(
-                    LoadBalancerArn=alb_arn,
-                    Protocol="HTTP",
-                    Port=80,
-                    DefaultActions=[{"Type": "forward", "TargetGroupArn": tg_arn}],
-                )
-                print("  Recreated HTTP:80 listener (was missing)")
+                _create_secure_listener(elbv2, alb_arn, tg_arn)
+                print("  Recreated HTTP:80 listener (default=403, CF header rule)")
             else:
                 print(f"  Listener OK ({len(listeners)} listener(s))")
 
@@ -287,16 +282,64 @@ def create_alb(subnet_ids: list, alb_sg_id: str, vpc_id: str):
     waiter = elbv2.get_waiter("load_balancer_available")
     waiter.wait(LoadBalancerArns=[alb_arn])
 
-    # HTTP:80 리스너
-    elbv2.create_listener(
+    # HTTP:80 리스너 (보안: 403 default + CF header rule)
+    _create_secure_listener(elbv2, alb_arn, tg_arn)
+    print("  Created HTTP:80 listener (default=403, CF header rule)")
+
+    return alb_arn, alb_dns, tg_arn
+
+
+def _create_secure_listener(elbv2, alb_arn: str, tg_arn: str):
+    """ALB 리스너 생성: 기본 403 + X-CF-Secret 헤더 매칭 시에만 forward"""
+    import os as _os
+    cf_secret = _os.environ.get("CF_ALB_SECRET", "")
+    if not cf_secret:
+        # config에서 시도
+        try:
+            config_path = Path(__file__).resolve().parent.parent / "admin_config.json"
+            with open(config_path, "r") as f:
+                cf_secret = json.load(f).get("cf_alb_secret", "")
+        except (FileNotFoundError, json.JSONDecodeError):
+            pass
+    if not cf_secret:
+        print("  WARNING: CF_ALB_SECRET not set. Creating plain forward listener.")
+        elbv2.create_listener(
+            LoadBalancerArn=alb_arn,
+            Protocol="HTTP",
+            Port=80,
+            DefaultActions=[{"Type": "forward", "TargetGroupArn": tg_arn}],
+        )
+        return
+
+    # 기본 action: 403 Forbidden
+    listener_resp = elbv2.create_listener(
         LoadBalancerArn=alb_arn,
         Protocol="HTTP",
         Port=80,
-        DefaultActions=[{"Type": "forward", "TargetGroupArn": tg_arn}],
+        DefaultActions=[{
+            "Type": "fixed-response",
+            "FixedResponseConfig": {
+                "StatusCode": "403",
+                "ContentType": "text/plain",
+                "MessageBody": "Forbidden",
+            },
+        }],
     )
-    print("  Created HTTP:80 listener")
+    listener_arn = listener_resp["Listeners"][0]["ListenerArn"]
 
-    return alb_arn, alb_dns, tg_arn
+    # Rule: X-CF-Secret 헤더 매칭 시 forward
+    elbv2.create_rule(
+        ListenerArn=listener_arn,
+        Priority=1,
+        Conditions=[{
+            "Field": "http-header",
+            "HttpHeaderConfig": {
+                "HttpHeaderName": "X-CF-Secret",
+                "Values": [cf_secret],
+            },
+        }],
+        Actions=[{"Type": "forward", "TargetGroupArn": tg_arn}],
+    )
 
 
 def create_ecs_cluster():

@@ -37,9 +37,7 @@ class AdminDataManager:
         self.bedrock_agent = boto3.client("bedrock-agent", region_name=region)
 
         tables = cfg.get("dynamodb_tables", {})
-        self.table_metadata = self.ddb.Table(tables.get("metadata", "ContentCatalog-Metadata"))
-        self.table_characters = self.ddb.Table(tables.get("characters", "ContentCatalog-Characters"))
-        self.table_relationships = self.ddb.Table(tables.get("relationships", "ContentCatalog-Relationships"))
+        self.table = self.ddb.Table(tables.get("chatbot", "character_chatbot"))
 
         self.bucket_name = cfg.get("bucket_name", "")
         self.kb_id = cfg.get("knowledge_base_id", "")
@@ -56,6 +54,11 @@ class AdminDataManager:
             content_id = self._slugify(content_data.get("title_en", content_data.get("title", "")))
 
         item = {
+            "PK": f"CONTENT#{content_id}",
+            "SK": "METADATA",
+            "GSI1_PK": "CONTENTS",
+            "GSI1_SK": content_id,
+            "entity_type": "CONTENT",
             "content_id": content_id,
             "title": content_data.get("title", ""),
             "title_en": content_data.get("title_en", ""),
@@ -76,17 +79,21 @@ class AdminDataManager:
             "created_at": now,
             "updated_at": now,
         }
-        self.table_metadata.put_item(Item=self._sanitize(item))
+        self.table.put_item(Item=self._sanitize(item))
         return content_id
 
     def get_content(self, content_id: str) -> Optional[Dict[str, Any]]:
-        resp = self.table_metadata.get_item(Key={"content_id": content_id})
+        resp = self.table.get_item(Key={"PK": f"CONTENT#{content_id}", "SK": "METADATA"})
         if "Item" in resp:
             return self._convert_decimals(resp["Item"])
         return None
 
     def list_contents(self) -> List[Dict[str, Any]]:
-        resp = self.table_metadata.scan()
+        resp = self.table.query(
+            IndexName="GSI1",
+            KeyConditionExpression="GSI1_PK = :pk",
+            ExpressionAttributeValues={":pk": "CONTENTS"},
+        )
         items = resp.get("Items", [])
         return [self._convert_decimals(i) for i in items]
 
@@ -97,22 +104,37 @@ class AdminDataManager:
             expr_parts.append(f"#k{i} = :v{i}")
             attr_names[f"#k{i}"] = key
             attr_values[f":v{i}"] = self._sanitize(value)
-        self.table_metadata.update_item(
-            Key={"content_id": content_id},
+        self.table.update_item(
+            Key={"PK": f"CONTENT#{content_id}", "SK": "METADATA"},
             UpdateExpression="SET " + ", ".join(expr_parts),
             ExpressionAttributeNames=attr_names,
             ExpressionAttributeValues=attr_values,
         )
 
     def delete_content(self, content_id: str):
-        # 연관 캐릭터/관계도 삭제
-        chars = self.list_characters(content_id)
-        for c in chars:
-            self.delete_character(content_id, c["character_id"])
-        rels = self.list_relationships(content_id)
-        for r in rels:
-            self.delete_relationship(content_id, r["relationship_id"])
-        self.table_metadata.delete_item(Key={"content_id": content_id})
+        """콘텐츠 및 연관 캐릭터/관계 일괄 삭제 (단일 PK query → batch delete)"""
+        pk = f"CONTENT#{content_id}"
+        resp = self.table.query(
+            KeyConditionExpression="PK = :pk",
+            ExpressionAttributeValues={":pk": pk},
+            ProjectionExpression="PK, SK",
+        )
+        items = resp.get("Items", [])
+        if not items:
+            return
+        # batch_write_item 25개 단위
+        ddb_client = self.ddb.meta.client
+        table_name = self.table.table_name
+        for i in range(0, len(items), 25):
+            batch = items[i:i + 25]
+            ddb_client.batch_write_item(
+                RequestItems={
+                    table_name: [
+                        {"DeleteRequest": {"Key": {"PK": {"S": item["PK"]}, "SK": {"S": item["SK"]}}}}
+                        for item in batch
+                    ]
+                }
+            )
 
     # ─── 캐릭터 CRUD ────────────────────────────────────────────────
 
@@ -122,13 +144,19 @@ class AdminDataManager:
         if not character_id:
             character_id = self._slugify(char_data.get("name_en", char_data.get("name", "")))
 
+        role_type = char_data.get("role_type", "supporting")
         item = {
+            "PK": f"CONTENT#{content_id}",
+            "SK": f"CHAR#{character_id}",
+            "GSI1_PK": f"CONTENT#{content_id}",
+            "GSI1_SK": f"ROLE#{role_type}#{character_id}",
+            "entity_type": "CHARACTER",
             "content_id": content_id,
             "character_id": character_id,
             "name": char_data.get("name", ""),
             "name_en": char_data.get("name_en", ""),
             "group": char_data.get("group", ""),
-            "role_type": char_data.get("role_type", "supporting"),
+            "role_type": role_type,
             "role_in_story": char_data.get("role_in_story", ""),
             "personality_traits": char_data.get("personality_traits", []),
             "personality_description": char_data.get("personality_description", ""),
@@ -148,31 +176,32 @@ class AdminDataManager:
             "created_at": now,
             "updated_at": now,
         }
-        self.table_characters.put_item(Item=self._sanitize(item))
+        self.table.put_item(Item=self._sanitize(item))
 
         # character_count 업데이트
         self._update_character_count(content_id)
         return character_id
 
     def get_character(self, content_id: str, character_id: str) -> Optional[Dict[str, Any]]:
-        resp = self.table_characters.get_item(
-            Key={"content_id": content_id, "character_id": character_id}
+        resp = self.table.get_item(
+            Key={"PK": f"CONTENT#{content_id}", "SK": f"CHAR#{character_id}"}
         )
         if "Item" in resp:
             return self._convert_decimals(resp["Item"])
         return None
 
     def list_characters(self, content_id: str, role_type: str = None) -> List[Dict[str, Any]]:
+        pk = f"CONTENT#{content_id}"
         if role_type:
-            resp = self.table_characters.query(
-                IndexName="RoleTypeIndex",
-                KeyConditionExpression="content_id = :cid AND role_type = :rt",
-                ExpressionAttributeValues={":cid": content_id, ":rt": role_type},
+            resp = self.table.query(
+                IndexName="GSI1",
+                KeyConditionExpression="GSI1_PK = :pk AND begins_with(GSI1_SK, :prefix)",
+                ExpressionAttributeValues={":pk": pk, ":prefix": f"ROLE#{role_type}#"},
             )
         else:
-            resp = self.table_characters.query(
-                KeyConditionExpression="content_id = :cid",
-                ExpressionAttributeValues={":cid": content_id},
+            resp = self.table.query(
+                KeyConditionExpression="PK = :pk AND begins_with(SK, :prefix)",
+                ExpressionAttributeValues={":pk": pk, ":prefix": "CHAR#"},
             )
         return [self._convert_decimals(i) for i in resp.get("Items", [])]
 
@@ -183,23 +212,23 @@ class AdminDataManager:
             expr_parts.append(f"#k{i} = :v{i}")
             attr_names[f"#k{i}"] = key
             attr_values[f":v{i}"] = self._sanitize(value)
-        self.table_characters.update_item(
-            Key={"content_id": content_id, "character_id": character_id},
+        self.table.update_item(
+            Key={"PK": f"CONTENT#{content_id}", "SK": f"CHAR#{character_id}"},
             UpdateExpression="SET " + ", ".join(expr_parts),
             ExpressionAttributeNames=attr_names,
             ExpressionAttributeValues=attr_values,
         )
 
     def delete_character(self, content_id: str, character_id: str):
-        self.table_characters.delete_item(
-            Key={"content_id": content_id, "character_id": character_id}
+        self.table.delete_item(
+            Key={"PK": f"CONTENT#{content_id}", "SK": f"CHAR#{character_id}"}
         )
         self._update_character_count(content_id)
 
     def _update_character_count(self, content_id: str):
         chars = self.list_characters(content_id)
-        self.table_metadata.update_item(
-            Key={"content_id": content_id},
+        self.table.update_item(
+            Key={"PK": f"CONTENT#{content_id}", "SK": "METADATA"},
             UpdateExpression="SET character_count = :cnt",
             ExpressionAttributeValues={":cnt": len(chars)},
         )
@@ -214,6 +243,11 @@ class AdminDataManager:
         relationship_id = f"{source}#{target}#{rel_type}"
 
         item = {
+            "PK": f"CONTENT#{content_id}",
+            "SK": f"REL#{relationship_id}",
+            "GSI1_PK": f"CONTENT#{content_id}",
+            "GSI1_SK": f"REL#{relationship_id}",
+            "entity_type": "RELATIONSHIP",
             "content_id": content_id,
             "relationship_id": relationship_id,
             "source_character": source,
@@ -224,19 +258,19 @@ class AdminDataManager:
             "key_moments": rel_data.get("key_moments", []),
             "created_at": now,
         }
-        self.table_relationships.put_item(Item=self._sanitize(item))
+        self.table.put_item(Item=self._sanitize(item))
         return relationship_id
 
     def list_relationships(self, content_id: str) -> List[Dict[str, Any]]:
-        resp = self.table_relationships.query(
-            KeyConditionExpression="content_id = :cid",
-            ExpressionAttributeValues={":cid": content_id},
+        resp = self.table.query(
+            KeyConditionExpression="PK = :pk AND begins_with(SK, :prefix)",
+            ExpressionAttributeValues={":pk": f"CONTENT#{content_id}", ":prefix": "REL#"},
         )
         return [self._convert_decimals(i) for i in resp.get("Items", [])]
 
     def delete_relationship(self, content_id: str, relationship_id: str):
-        self.table_relationships.delete_item(
-            Key={"content_id": content_id, "relationship_id": relationship_id}
+        self.table.delete_item(
+            Key={"PK": f"CONTENT#{content_id}", "SK": f"REL#{relationship_id}"}
         )
 
     # ─── S3 이미지 업로드 ───────────────────────────────────────────

@@ -90,7 +90,7 @@ def collect_env_interactive() -> dict:
         "AWS_ACCOUNT_ID": detected_account_id,
         "AWS_REGION": "us-east-1",
         "S3_BUCKET_NAME": f"content-chatbot-{suffix}",
-        "DDB_TABLE_PREFIX": "ContentCatalog",
+        "DDB_TABLE_NAME": "character_chatbot",
         "KB_NAME": f"content-chatbot-kb-{suffix}",
         "CONTENT_DATA_PREFIX": "content-data/",
         "COGNITO_USER_POOL_ID": cognito_pool_id,
@@ -101,7 +101,7 @@ def collect_env_interactive() -> dict:
         "AWS_ACCOUNT_ID": "AWS 계정 ID",
         "AWS_REGION": "AWS 리전",
         "S3_BUCKET_NAME": "S3 버킷 이름",
-        "DDB_TABLE_PREFIX": "DynamoDB 테이블 접두사 (뒤에 -Metadata/-Characters/-Relationships 붙음)",
+        "DDB_TABLE_NAME": "DynamoDB 테이블 이름 (Single-Table Design)",
         "KB_NAME": "Bedrock Knowledge Base 이름 (기존 KB 사용 시 'existing' 입력)",
         "CONTENT_DATA_PREFIX": "S3 콘텐츠 데이터 접두사",
         "COGNITO_USER_POOL_ID": "Cognito User Pool ID (없으면 빈 칸)",
@@ -206,67 +206,44 @@ def ensure_s3_bucket(env: dict):
 
 
 def create_dynamodb_tables(env: dict):
-    """DynamoDB 테이블 생성"""
-    prefix = env["DDB_TABLE_PREFIX"]
+    """DynamoDB 단일 테이블 (character_chatbot) 확인/생성"""
+    table_name = env.get("DDB_TABLE_NAME", "character_chatbot")
     region = env["AWS_REGION"]
     ddb = boto3.client("dynamodb", region_name=region)
     existing = ddb.list_tables()["TableNames"]
 
-    table_defs = [
-        {
-            "TableName": f"{prefix}-Metadata",
-            "KeySchema": [{"AttributeName": "content_id", "KeyType": "HASH"}],
-            "AttributeDefinitions": [{"AttributeName": "content_id", "AttributeType": "S"}],
-            "BillingMode": "PAY_PER_REQUEST",
-        },
-        {
-            "TableName": f"{prefix}-Characters",
-            "KeySchema": [
-                {"AttributeName": "content_id", "KeyType": "HASH"},
-                {"AttributeName": "character_id", "KeyType": "RANGE"},
-            ],
-            "AttributeDefinitions": [
-                {"AttributeName": "content_id", "AttributeType": "S"},
-                {"AttributeName": "character_id", "AttributeType": "S"},
-                {"AttributeName": "role_type", "AttributeType": "S"},
-            ],
-            "BillingMode": "PAY_PER_REQUEST",
-            "GlobalSecondaryIndexes": [
-                {
-                    "IndexName": "RoleTypeIndex",
-                    "KeySchema": [
-                        {"AttributeName": "content_id", "KeyType": "HASH"},
-                        {"AttributeName": "role_type", "KeyType": "RANGE"},
-                    ],
-                    "Projection": {"ProjectionType": "ALL"},
-                }
-            ],
-        },
-        {
-            "TableName": f"{prefix}-Relationships",
-            "KeySchema": [
-                {"AttributeName": "content_id", "KeyType": "HASH"},
-                {"AttributeName": "relationship_id", "KeyType": "RANGE"},
-            ],
-            "AttributeDefinitions": [
-                {"AttributeName": "content_id", "AttributeType": "S"},
-                {"AttributeName": "relationship_id", "AttributeType": "S"},
-            ],
-            "BillingMode": "PAY_PER_REQUEST",
-        },
-    ]
+    if table_name in existing:
+        print(f"  [SKIP] {table_name} — 이미 존재합니다")
+        return
 
-    for table_def in table_defs:
-        name = table_def["TableName"]
-        if name in existing:
-            print(f"  [SKIP] {name} — 이미 존재합니다")
-            continue
-
-        print(f"  [CREATE] {name} ...", end=" ", flush=True)
-        ddb.create_table(**table_def)
-        waiter = ddb.get_waiter("table_exists")
-        waiter.wait(TableName=name, WaiterConfig={"Delay": 3, "MaxAttempts": 30})
-        print("완료")
+    print(f"  [CREATE] {table_name} ...", end=" ", flush=True)
+    ddb.create_table(
+        TableName=table_name,
+        KeySchema=[
+            {"AttributeName": "PK", "KeyType": "HASH"},
+            {"AttributeName": "SK", "KeyType": "RANGE"},
+        ],
+        AttributeDefinitions=[
+            {"AttributeName": "PK", "AttributeType": "S"},
+            {"AttributeName": "SK", "AttributeType": "S"},
+            {"AttributeName": "GSI1_PK", "AttributeType": "S"},
+            {"AttributeName": "GSI1_SK", "AttributeType": "S"},
+        ],
+        BillingMode="PAY_PER_REQUEST",
+        GlobalSecondaryIndexes=[
+            {
+                "IndexName": "GSI1",
+                "KeySchema": [
+                    {"AttributeName": "GSI1_PK", "KeyType": "HASH"},
+                    {"AttributeName": "GSI1_SK", "KeyType": "RANGE"},
+                ],
+                "Projection": {"ProjectionType": "ALL"},
+            }
+        ],
+    )
+    waiter = ddb.get_waiter("table_exists")
+    waiter.wait(TableName=table_name, WaiterConfig={"Delay": 3, "MaxAttempts": 30})
+    print("완료")
 
 
 def setup_knowledge_base(env: dict) -> tuple:
@@ -361,7 +338,7 @@ def _ensure_data_source(client, kb_id: str, env: dict) -> str:
 
 def save_admin_config(env: dict, kb_id: str, ds_id: str):
     """admin_config.json 저장"""
-    prefix = env["DDB_TABLE_PREFIX"]
+    table_name = env.get("DDB_TABLE_NAME", "character_chatbot")
     config = {
         "region": env["AWS_REGION"],
         "bucket_name": env["S3_BUCKET_NAME"],
@@ -371,9 +348,7 @@ def save_admin_config(env: dict, kb_id: str, ds_id: str):
         "cognito_user_pool_id": env.get("COGNITO_USER_POOL_ID", ""),
         "cognito_client_id": env.get("COGNITO_CLIENT_ID", ""),
         "dynamodb_tables": {
-            "metadata": f"{prefix}-Metadata",
-            "characters": f"{prefix}-Characters",
-            "relationships": f"{prefix}-Relationships",
+            "chatbot": table_name,
         },
     }
 
